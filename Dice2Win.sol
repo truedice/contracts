@@ -1,16 +1,24 @@
-pragma solidity ^0.4.24;
 
-// * dice2.win - fair games that pay Ether. Version 5.
-//
-// * Ethereum smart contract, deployed at 0xD1CEeeeee83F8bCF3BEDad437202b6154E9F5405.
-//
-// * Uses hybrid commit-reveal + block hash random number generation that is immune
-//   to tampering by players, house and miners. Apart from being fully transparent,
-//   this also allows arbitrarily high bets.
-//
-// * Refer to https://dice2.win/whitepaper.pdf for detailed description and proofs.
+pragma solidity ^0.5.4;
 
-contract Dice2Win {
+// ----------------------------------------------------------------------------
+// ERC Token Standard #20 Interface
+// https://github.com/ethereum/EIPs/blob/master/EIPS/eip-20.md
+// ----------------------------------------------------------------------------
+contract ERC20Interface {
+    function totalSupply() public view returns (uint);
+    function balanceOf(address tokenOwner) public view returns (uint balance);
+    function allowance(address tokenOwner, address spender) public view returns (uint remaining);
+    function transfer(address to, uint tokens) public returns (bool success);
+    function approve(address spender, uint tokens) public returns (bool success);
+    function transferFrom(address from, address to, uint tokens) public returns (bool success);
+
+    event Transfer(address indexed from, address indexed to, uint tokens);
+    event Approval(address indexed tokenOwner, address indexed spender, uint tokens);
+}
+
+
+contract TrueDiceWin {
     /// *** Constants section
 
     // Each bet is deducted 1% in favour of the house, but no less than some minimum.
@@ -31,6 +39,9 @@ contract Dice2Win {
     uint constant MIN_BET = 0.01 ether;
     uint constant MAX_AMOUNT = 300000 ether;
 
+    uint constant TDICE_WIN_RATIO = 10000; //Bet 1 ether will bonus 10000 TDICE if losing
+    uint constant TDICE_LOSE_RATIO = 5000; //Bet 1 ether will bonus 5000 TDICE if winning
+    
     // Modulo is a number of equiprobable outcomes in a game:
     //  - 2 for coin flip
     //  - 6 for dice
@@ -70,8 +81,11 @@ contract Dice2Win {
     address constant DUMMY_ADDRESS = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     // Standard contract ownership transfer.
-    address public owner;
-    address private nextOwner;
+    address payable public owner;
+    address payable private nextOwner;
+    
+    //TrueDice token address
+    address payable public trueDiceToken = 0x0458beCB1b7DccCF127AE52c3Fc1b890930b4005;
 
     // Adjustable max bet profit. Used to cap bets against dynamic odds.
     uint public maxProfit;
@@ -100,7 +114,7 @@ contract Dice2Win {
         // Bit mask representing winning bet outcomes (see MAX_MASK_MODULO comment).
         uint40 mask;
         // Address of a gambler, used to pay out winning bets.
-        address gambler;
+        address payable gambler;
     }
 
     // Mapping from commits to all currently active & processed bets.
@@ -116,6 +130,8 @@ contract Dice2Win {
 
     // This event is emitted in placeBet to record commit in the logs.
     event Commit(uint commit);
+
+    event TokenDistribute(address indexed beneficiary, uint amount);
 
     // Constructor. Deliberately does not take any parameters.
     constructor () public {
@@ -137,7 +153,7 @@ contract Dice2Win {
     }
 
     // Standard contract ownership transfer implementation,
-    function approveNextOwner(address _nextOwner) external onlyOwner {
+    function approveNextOwner(address payable _nextOwner) external onlyOwner {
         require (_nextOwner != owner, "Cannot approve current owner.");
         nextOwner = _nextOwner;
     }
@@ -149,7 +165,7 @@ contract Dice2Win {
 
     // Fallback function deliberately left empty. It's primary use case
     // is to top up the bank roll.
-    function () public payable {
+    function () external payable {
     }
 
     // See comment for "secretSigner" variable.
@@ -176,18 +192,13 @@ contract Dice2Win {
     }
 
     // Funds withdrawal to cover costs of dice2.win operation.
-    function withdrawFunds(address beneficiary, uint withdrawAmount) external onlyOwner {
+    function withdrawFunds(address payable beneficiary, uint withdrawAmount) external onlyOwner {
         require (withdrawAmount <= address(this).balance, "Increase amount larger than balance.");
         require (jackpotSize + lockedInBets + withdrawAmount <= address(this).balance, "Not enough funds.");
         sendFunds(beneficiary, withdrawAmount, withdrawAmount);
     }
 
-    // Contract may be destroyed only when there are no ongoing bets,
-    // either settled or refunded. All funds are transferred to contract owner.
-    function kill() external onlyOwner {
-        require (lockedInBets == 0, "All bets should be processed (settled or refunded) before self-destruct.");
-        selfdestruct(owner);
-    }
+
 
     /// *** Betting logic
 
@@ -218,7 +229,7 @@ contract Dice2Win {
     // it would be possible for a miner to place a bet with a known commit/reveal pair and tamper
     // with the blockhash. Croupier guarantees that commitLastBlock will always be not greater than
     // placeBet block number plus BET_EXPIRATION_BLOCKS. See whitepaper for details.
-    function placeBet(uint betMask, uint modulo, uint commitLastBlock, uint commit, bytes32 r, bytes32 s) external payable {
+    function placeBet(uint betMask, uint modulo, uint commitLastBlock, uint commit, bytes32 r, bytes32 s, uint8 v) external payable {
         // Check that the bet is in 'clean' state.
         Bet storage bet = bets[commit];
         require (bet.gambler == address(0), "Bet should be in a 'clean' state.");
@@ -231,8 +242,9 @@ contract Dice2Win {
 
         // Check that commit is valid - it has not expired and its signature is valid.
         require (block.number <= commitLastBlock, "Commit has expired.");
-        bytes32 signatureHash = keccak256(abi.encodePacked(uint40(commitLastBlock), commit));
-        require (secretSigner == ecrecover(signatureHash, 27, r, s), "ECDSA signature is not valid.");
+        bytes32 hash = keccak256(abi.encodePacked(commitLastBlock, commit));
+        bytes32 signatureHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32",hash));
+        require (secretSigner == ecrecover(signatureHash, v, r, s), "ECDSA signature is not valid.");
 
         uint rollUnder;
         uint mask;
@@ -293,7 +305,7 @@ contract Dice2Win {
         // Check that bet has not expired yet (see comment to BET_EXPIRATION_BLOCKS).
         require (block.number > placeBlockNumber, "settleBet in the same block as placeBet, or before.");
         require (block.number <= placeBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
-        require (blockhash(placeBlockNumber) == blockHash);
+        require (blockhash(placeBlockNumber) == blockHash, "Blockhash is not the same as block as placeBet");
 
         // Settle bet using reveal and blockHash as entropy sources.
         settleBetCommon(bet, reveal, blockHash);
@@ -332,7 +344,7 @@ contract Dice2Win {
         uint amount = bet.amount;
         uint modulo = bet.modulo;
         uint rollUnder = bet.rollUnder;
-        address gambler = bet.gambler;
+        address payable gambler = bet.gambler;
 
         // Check that bet is in 'active' state.
         require (amount != 0, "Bet should be in an 'active' state");
@@ -393,7 +405,21 @@ contract Dice2Win {
         }
 
         // Send the funds to gambler.
-        sendFunds(gambler, diceWin + jackpotWin == 0 ? 1 wei : diceWin + jackpotWin, diceWin);
+        if(diceWin+jackpotWin==0) {
+            sendFunds(gambler, 1 wei,diceWin);
+            distribution(gambler,amount*TDICE_WIN_RATIO);
+        }else{
+            sendFunds(gambler, diceWin + jackpotWin,diceWin);
+            distribution(gambler,amount*TDICE_LOSE_RATIO);
+        }
+    }
+
+
+    function distribution(address contributor, uint amount) internal{
+        if(ERC20Interface(trueDiceToken).balanceOf(address(this))>amount){
+            ERC20Interface(trueDiceToken).transfer(contributor, amount);
+            emit TokenDistribute(contributor,amount);
+        }
     }
 
     // Refund transaction - return the bet amount of a roll that was not processed in a
@@ -440,14 +466,29 @@ contract Dice2Win {
         require (houseEdge + jackpotFee <= amount, "Bet doesn't even cover house edge.");
         winAmount = (amount - houseEdge - jackpotFee) * modulo / rollUnder;
     }
-
+ 
     // Helper routine to process the payment.
-    function sendFunds(address beneficiary, uint amount, uint successLogAmount) private {
+    function sendFunds(address payable beneficiary, uint amount, uint successLogAmount) private {
         if (beneficiary.send(amount)) {
             emit Payment(beneficiary, successLogAmount);
         } else {
             emit FailedPayment(beneficiary, amount);
         }
+    }
+
+
+      // ------------------------------------------------------------------------
+    // Owner can transfer out any accidentally sent ERC20 tokens
+    // ------------------------------------------------------------------------
+    function transferAnyERC20Token(address tokenAddress, uint tokens) public onlyOwner returns (bool success) {
+        return ERC20Interface(tokenAddress).transfer(owner, tokens);
+    }
+
+        // Contract may be destroyed only when there are no ongoing bets,
+    // either settled or refunded. All funds are transferred to contract owner.
+    function kill() external onlyOwner {
+        require (lockedInBets == 0, "All bets should be processed (settled or refunded) before self-destruct.");
+        selfdestruct(owner);
     }
 
     // This are some constants making O(1) population count in placeBet possible.
@@ -499,7 +540,7 @@ contract Dice2Win {
             assembly {
                 calldatacopy(scratchBuf1, offset, blobLength)
                 mstore(add(scratchBuf1, shift), seedHash)
-                seedHash := sha3(scratchBuf1, blobLength)
+                seedHash := keccak256(scratchBuf1, blobLength)
                 uncleHeaderLength := blobLength
             }
         }
@@ -517,7 +558,7 @@ contract Dice2Win {
         assembly { calldatacopy(scratchBuf2, offset, unclesLength) }
         memcpy(scratchBuf2 + unclesShift, scratchBuf1, uncleHeaderLength);
 
-        assembly { seedHash := sha3(scratchBuf2, unclesLength) }
+        assembly { seedHash := keccak256(scratchBuf2, unclesLength) }
 
         offset += unclesLength;
 
@@ -537,7 +578,7 @@ contract Dice2Win {
             mstore(add(scratchBuf1, shift), seedHash)
 
             // At this moment the canonical block hash is known.
-            blockHash := sha3(scratchBuf1, blobLength)
+            blockHash := keccak256(scratchBuf1, blobLength)
         }
     }
 
@@ -615,4 +656,5 @@ contract Dice2Win {
             mstore(dest, or(destpart, srcpart))
         }
     }
+
 }
