@@ -39,8 +39,8 @@ contract TrueDiceWin {
     uint constant MIN_BET = 0.01 ether;
     uint constant MAX_AMOUNT = 300000 ether;
 
-    uint constant TDICE_WIN_RATIO = 10000; //Bet 1 ether will bonus 10000 TDICE if losing
-    uint constant TDICE_LOSE_RATIO = 5000; //Bet 1 ether will bonus 5000 TDICE if winning
+    uint constant TDICE_WIN_RATIO = 1000; //Bet 1 ether will bonus 10000 TDICE if losing
+    uint constant TDICE_LOSE_RATIO = 500; //Bet 1 ether will bonus 5000 TDICE if winning
     
     // Modulo is a number of equiprobable outcomes in a game:
     //  - 2 for coin flip
