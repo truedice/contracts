@@ -35,13 +35,21 @@ contract TrueDiceWin {
     uint constant JACKPOT_MODULO = 1000;
     uint constant JACKPOT_FEE = 0.001 ether;
 
+    // Change to win lottery (0.01%) and price of one ticket
+    uint constant LOTTERY_MODULO = 10000;
+    uint constant LOTTERY_PRICE = 0.01 ether;
+    uint128 constant BASE_LOTTERY_PRIZE = 5 ether;
+
+    // When someone winning lottery 20% of lottery pot come to house for next phase and operator cost
+    uint constant WIN_FEE = 20;
+
     // There is minimum and maximum bets.
     uint constant MIN_BET = 0.01 ether;
     uint constant MAX_AMOUNT = 300000 ether;
 
-    uint constant TDICE_WIN_RATIO = 1000; //Bet 1 ether will bonus 10000 TDICE if losing
-    uint constant TDICE_LOSE_RATIO = 500; //Bet 1 ether will bonus 5000 TDICE if winning
-    
+    uint constant TDICE_WIN_RATIO = 10000; //Bet 1 ether will bonus 10000 TDICE if losing
+    uint constant TDICE_LOSE_RATIO = 5000; //Bet 1 ether will bonus 5000 TDICE if winning
+
     // Modulo is a number of equiprobable outcomes in a game:
     //  - 2 for coin flip
     //  - 6 for dice
@@ -83,7 +91,7 @@ contract TrueDiceWin {
     // Standard contract ownership transfer.
     address payable public owner;
     address payable private nextOwner;
-    
+
     //TrueDice token address
     address payable public trueDiceToken = 0x0458beCB1b7DccCF127AE52c3Fc1b890930b4005;
 
@@ -95,6 +103,9 @@ contract TrueDiceWin {
 
     // Accumulated jackpot fund.
     uint128 public jackpotSize;
+
+    // Current lottery pot fund;
+    uint128 public lotteryPrize;
 
     // Funds that are locked in potentially winning bets. Prevents contract from
     // committing to bets it cannot pay out.
@@ -117,8 +128,16 @@ contract TrueDiceWin {
         address payable gambler;
     }
 
+    struct Ticket {
+        uint amount;
+        uint40 buyBlockNumber;
+        address payable gambler;
+    }
+
     // Mapping from commits to all currently active & processed bets.
     mapping (uint => Bet) bets;
+
+    mapping (uint => Ticket) tickets;
 
     // Croupier account.
     address public croupier;
@@ -127,9 +146,13 @@ contract TrueDiceWin {
     event FailedPayment(address indexed beneficiary, uint amount);
     event Payment(address indexed beneficiary, uint amount);
     event JackpotPayment(address indexed beneficiary, uint amount);
+    event ScratchPayment(address indexed beneficiary, uint amount);
 
     // This event is emitted in placeBet to record commit in the logs.
     event Commit(uint commit);
+
+    // This event is emitted in buyLotteryTicket to record commit in the logs.
+    event TicketCommit(uint commit);
 
     event TokenDistribute(address indexed beneficiary, uint amount);
 
@@ -191,11 +214,126 @@ contract TrueDiceWin {
         jackpotSize += uint128(increaseAmount);
     }
 
-    // Funds withdrawal to cover costs of dice2.win operation.
+    // Funds withdrawal to cover costs of truedice.win operation.
     function withdrawFunds(address payable beneficiary, uint withdrawAmount) external onlyOwner {
         require (withdrawAmount <= address(this).balance, "Increase amount larger than balance.");
         require (jackpotSize + lockedInBets + withdrawAmount <= address(this).balance, "Not enough funds.");
         sendFunds(beneficiary, withdrawAmount, withdrawAmount);
+    }
+
+    // see placeBet
+    function buyTicket(uint commitLastBlock, uint commit, bytes32 r, bytes32 s, uint8 v) external payable{
+        Ticket storage ticket = tickets[commit];
+
+        // Check that the ticket is in 'clean' state.
+        require (ticket.gambler == address(0), "Bet should be in a 'clean' state.");
+
+        uint amount = msg.value;
+        // Validate input value.
+        require (amount == LOTTERY_PRICE, "Lottery price should match.");
+
+        // Check that commit is valid - it has not expired and its signature is valid.
+        require (block.number <= commitLastBlock, "Commit has expired.");
+        bytes32 hash = keccak256(abi.encodePacked(commitLastBlock, commit));
+        bytes32 signatureHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32",hash));
+        require (secretSigner == ecrecover(signatureHash, v, r, s), "ECDSA signature is not valid.");
+
+        if(lotteryPrize == 0){
+            lotteryPrize = BASE_LOTTERY_PRIZE;
+            lockedInBets += lotteryPrize;
+        }
+
+        lockedInBets += uint128(amount);
+        //lotteryPrize += uint128(amount);
+
+        // Check whether contract has enough funds to process this lottery ticket.
+        require(lotteryPrize + amount < address(this).balance, "");
+
+        emit TicketCommit(commit);
+
+        // Store ticket parameters on blockchain.
+        ticket.amount = amount;
+        ticket.buyBlockNumber = uint40(block.number);
+        ticket.gambler = msg.sender;
+
+    }
+
+    function scratchTicket(uint reveal, bytes32 blockHash) external onlyCroupier {
+
+        uint commit = uint(keccak256(abi.encodePacked(reveal)));
+
+        Ticket storage ticket = tickets[commit];
+        uint buyBlockNumber = ticket.buyBlockNumber;
+
+        // Check that ticket has not expired yet (see comment to BET_EXPIRATION_BLOCKS).
+        require (block.number > buyBlockNumber, "scratchTicket in the same block as buyTicket, or before.");
+        require (block.number <= buyBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
+        require (blockhash(buyBlockNumber) == blockHash, "Blockhash is not the same as block as placeBet");
+
+        //  scratch ticket using reveal and blockHash as entropy sources.
+        scratchCommon(ticket, reveal, blockHash);
+    }
+
+        function scratchUncleMerkleProof(uint reveal, uint40 canonicalBlockNumber) external onlyCroupier {
+        // "commit" for ticket can only be obtained by hashing a "reveal".
+        uint commit = uint(keccak256(abi.encodePacked(reveal)));
+
+        Ticket storage ticket = tickets[commit];
+
+        // Check that canonical block hash can still be verified.
+        require (block.number <= canonicalBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
+
+        // Verify buyTicket receipt.
+        requireCorrectReceipt(4 + 32 + 32 + 4);
+
+        // Reconstruct canonical & uncle block hashes from a receipt merkle proof, verify them.
+        bytes32 canonicalHash;
+        bytes32 uncleHash;
+        (canonicalHash, uncleHash) = verifyMerkleProof(commit, 4 + 32 + 32);
+        require (blockhash(canonicalBlockNumber) == canonicalHash);
+
+        // scratch ticket using reveal and uncleHash as entropy sources.
+        scratchCommon(ticket, reveal, uncleHash);
+    }
+
+    // Common settlement code for settleBet & settleBetUncleMerkleProof.
+    function scratchCommon(Ticket storage ticket, uint reveal, bytes32 entropyBlockHash) private {
+        // Fetch bet parameters into local variables (to save gas).
+        address payable gambler = ticket.gambler;
+        uint amount = ticket.amount;
+        // Check that bet is in 'active' state.
+        require (amount != 0, "Bet should be in an 'active' state");
+
+        // Move bet into 'processed' state already.
+        ticket.amount = 0;
+        lotteryPrize += uint128(amount);
+        // The RNG - combine "reveal" and blockhash of buyTicket using Keccak256. Miners
+        // are not aware of "reveal" and cannot deduce it from "commit" (as Keccak256
+        // preimage is intractable), and house is unable to alter the "reveal" after
+        // buyTicket have been mined (as Keccak256 collision finding is also intractable).
+        bytes32 entropy = keccak256(abi.encodePacked(reveal, entropyBlockHash));
+
+        // Do a roll by taking a modulo of entropy. Compute winning amount.
+        uint scratch = uint(entropy) % LOTTERY_MODULO;
+
+        uint possibleWinAmount = lotteryPrize;
+        uint winFee = possibleWinAmount * WIN_FEE / 100;
+        uint winAmount = 0;
+
+        // Determine lottery outcome.
+        if (scratch == 0) {
+            winAmount = possibleWinAmount - winFee;
+            lotteryPrize = 0;
+            lockedInBets -= uint128(possibleWinAmount);
+        }
+
+        emit ScratchPayment(gambler,winAmount);
+        // Send the funds to gambler.
+        if(winAmount==0) {
+            sendFunds(gambler, 1 wei, 0);
+        }else{
+            sendFunds(gambler, winAmount, 0);
+        }
     }
 
 
@@ -658,3 +796,4 @@ contract TrueDiceWin {
     }
 
 }
+
