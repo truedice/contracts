@@ -1,3 +1,5 @@
+We've added TrueDiceWin Tron Smart Contract, now user can play truedice.win on Tron Network using TRX token.
+
 What is this?
 
 - This contract is a fork of origin dice2-win contract that provably fair bets on ethereum network.
